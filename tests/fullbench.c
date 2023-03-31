@@ -102,6 +102,7 @@ static int g_compressionAlgo = ALL_COMPRESSORS;
 static int g_decompressionTest = 1;
 static int g_decompressionAlgo = ALL_DECOMPRESSORS;
 static int g_noPrompt = 0;
+static int g_compresslevel = 1;
 
 static void BMK_setBlocksize(int bsize)
 {
@@ -322,11 +323,45 @@ static int local_LZ4_decompress_safe_partial(const char* in, char* out, int inSi
     return outSize;
 }
 
-
+static LZ4F_compressionContext_t g_cCtx;
 /* frame functions */
 static int local_LZ4F_compressFrame(const char* in, char* out, int inSize)
 {
     return (int)LZ4F_compressFrame(out, LZ4F_compressFrameBound(inSize, NULL), in, inSize, NULL);
+}
+
+static int local_LZ4F_compressBegin(char* out, int inSize)
+{
+    LZ4F_preferences_t preferences;
+    memset(&preferences, 0, sizeof(LZ4F_preferences_t));
+    preferences.frameInfo.blockMode = 0;
+    preferences.frameInfo.blockChecksumFlag = 0;
+    preferences.frameInfo.contentChecksumFlag = 0;
+    preferences.frameInfo.contentSize = inSize;
+    preferences.autoFlush = 1;
+    preferences.compressionLevel = g_compresslevel;
+    return LZ4F_compressBegin(g_cCtx, out, LZ4F_compressBound(inSize,NULL), &preferences);
+}
+
+static int local_LZ4F_compressUpdate(const char* in, char* out, int inSize)
+{
+    size_t compressedSize=0, header=0, body=0, tail=0;
+    compressedSize = LZ4F_compressFrameBound(inSize, NULL);
+    header = local_LZ4F_compressBegin(out, inSize);
+    out += header;
+    compressedSize -= header;
+    body = LZ4F_compressUpdate(g_cCtx, out, compressedSize, in, inSize, NULL);
+    out += body;
+    compressedSize -= body;
+    tail = LZ4F_compressEnd(g_cCtx, out, compressedSize, NULL);
+    out += tail;
+    compressedSize -= body;
+    return header + body + tail;
+}
+
+static int local_LZ4F_compressUpdate_frame(const char* in, char* out, int inSize)
+{
+    return LZ4F_compressUpdate(g_cCtx, out, LZ4F_compressBound(inSize, NULL), in, inSize, NULL);
 }
 
 static LZ4F_decompressionContext_t g_dCtx;
@@ -352,7 +387,8 @@ int fullSpeedBench(const char** fileNamesTable, int nbFiles)
     /* Init */
     { size_t const errorCode = LZ4F_createDecompressionContext(&g_dCtx, LZ4F_VERSION);
       if (LZ4F_isError(errorCode)) { DISPLAY("dctx allocation issue \n"); return 10; } }
-
+    { size_t const errorCode = LZ4F_createCompressionContext(&g_cCtx, LZ4F_VERSION);
+      if (LZ4F_isError(errorCode)) { DISPLAY("cctx allocation issue \n"); return 10; } }
     /* Loop for each fileName */
     while (fileIdx<nbFiles) {
       char* orig_buff = NULL;
@@ -367,7 +403,7 @@ int fullSpeedBench(const char** fileNamesTable, int nbFiles)
       size_t readSize;
       int compressedBuffSize;
       U32 crcOriginal;
-      size_t errorCode;
+      size_t header;
 
       /* Check file existence */
       if (inFile==NULL) { DISPLAY( "Pb opening %s\n", inFileName); return 11; }
@@ -467,7 +503,14 @@ int fullSpeedBench(const char** fileNamesTable, int nbFiles)
             case 20: compressionFunction = local_LZ4_compress_forceDict; initFunction = local_LZ4_resetDictT; compressorName = "LZ4_compress_forceDict"; break;
 #endif
             case 30: compressionFunction = local_LZ4F_compressFrame; compressorName = "LZ4F_compressFrame";
-                        chunkP[0].origSize = (int)benchedSize; nbChunks=1;
+                        break;
+            case 31: compressionFunction = local_LZ4F_compressUpdate; compressorName = "LZ4F_compressUpdate";
+                        break;
+            case 32: compressionFunction = local_LZ4F_compressUpdate_frame; compressorName = "local_LZ4F_compressUpdate_frame";
+                        header = local_LZ4F_compressBegin(chunkP[0].compressedBuffer, chunkP[0].origSize);
+                        chunkP[0].compressedBuffer += header;
+                        chunkP[0].origSize -= header;
+                        chunkP[0].compressedSize = header;
                         break;
             case 40: compressionFunction = local_LZ4_saveDict; compressorName = "LZ4_saveDict";
                         if (chunkP[0].origSize < 8) { DISPLAY(" cannot bench %s with less then 8 bytes \n", compressorName); continue; }
@@ -561,17 +604,11 @@ int fullSpeedBench(const char** fileNamesTable, int nbFiles)
             case 8: decompressionFunction = local_LZ4_decompress_safe_forceExtDict; dName = "LZ4_decompress_safe_forceExtDict"; break;
 #endif
             case 9: decompressionFunction = local_LZ4F_decompress; dName = "LZ4F_decompress";
-                    errorCode = LZ4F_compressFrame(compressed_buff, compressedBuffSize, orig_buff, benchedSize, NULL);
-                    if (LZ4F_isError(errorCode)) {
-                        DISPLAY("Error while preparing compressed frame\n");
-                        free(orig_buff);
-                        free(compressed_buff);
-                        free(chunkP);
-                        return 1;
+                    for (chunkNb=0; chunkNb<nbChunks; chunkNb++) {
+                        chunkP[chunkNb].compressedSize = LZ4F_compressFrame(chunkP[chunkNb].compressedBuffer, maxCompressedChunkSize, chunkP[chunkNb].origBuffer, chunkP[chunkNb].origSize, NULL);
+                        if (chunkP[chunkNb].compressedSize==0)
+                            DISPLAY("ERROR ! %s() = 0 !! \n", "LZ4_compress"), exit(1);
                     }
-                    chunkP[0].origSize = (int)benchedSize;
-                    chunkP[0].compressedSize = (int)errorCode;
-                    nbChunks = 1;
                     break;
             default :
                 continue;   /* skip if unknown ID */
@@ -626,6 +663,7 @@ int fullSpeedBench(const char** fileNamesTable, int nbFiles)
     }
 
     LZ4F_freeDecompressionContext(g_dCtx);
+    LZ4F_freeCompressionContext(g_cCtx);
     if (g_pause) { printf("press enter...\n"); (void)getchar(); }
 
     return 0;
@@ -741,7 +779,12 @@ _exit_blockProperties:
                         argument++;
                     }
                     break;
-
+                case 'l':
+                    if ((argument[1] >='0') && (argument[1] <='9')) {
+                        g_compresslevel = argument[1] - '0';
+                        argument++;
+                    }
+                    break;
                     // Pause at the end (hidden option)
                 case 'p': BMK_setPause(); break;
 
